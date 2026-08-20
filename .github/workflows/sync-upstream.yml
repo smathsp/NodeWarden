@@ -1,0 +1,112 @@
+name: Sync upstream safely
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify sync token
+        env:
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::Repository secret UPSTREAM_SYNC_TOKEN is not configured."
+            exit 1
+          fi
+
+      - name: Check out fork
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/shuaiplus/NodeWarden.git
+          git fetch upstream main --tags
+
+      - name: Check for upstream changes
+        id: check
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            echo "Fork already contains the latest upstream commit."
+          else
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream changes detected."
+          fi
+
+      - name: Merge upstream without force
+        id: merge
+        if: steps.check.outputs.needs_update == 'true'
+        continue-on-error: true
+        run: |
+          if git merge --no-edit upstream/main; then
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          conflict_files=$(git diff --name-only --diff-filter=U | paste -sd ', ' -)
+          echo "conflict_files=$conflict_files" >> "$GITHUB_OUTPUT"
+          git merge --abort
+          exit 1
+
+      - name: Push merged changes
+        if: steps.check.outputs.needs_update == 'true' && steps.merge.outputs.merged == 'true'
+        run: git push origin HEAD:main
+
+      - name: Open conflict notification
+        if: steps.merge.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONFLICT_FILES: ${{ steps.merge.outputs.conflict_files }}
+        run: |
+          title="Automated upstream sync conflict"
+          existing=$(gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --search "$title in:title" \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body "The scheduled upstream sync failed again on $(date -u +%F). Conflicting files: ${CONFLICT_FILES:-unknown}. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          else
+            gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$title" \
+              --body "The scheduled merge from shuaiplus/NodeWarden failed on $(date -u +%F) and was safely aborted. No force push was performed. Conflicting files: ${CONFLICT_FILES:-unknown}. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          fi
+
+      - name: Fail after conflict notification
+        if: steps.merge.outcome == 'failure'
+        run: exit 1
+
+      - name: Write summary
+        if: always() && steps.merge.outcome != 'failure'
+        run: |
+          if [ "${{ steps.check.outputs.needs_update }}" = "true" ]; then
+            echo "### Upstream sync completed" >> "$GITHUB_STEP_SUMMARY"
+            echo "Merged upstream commit \`$(git rev-parse upstream/main)\` without force." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Already up to date" >> "$GITHUB_STEP_SUMMARY"
+          fi
