@@ -17,20 +17,38 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Verify sync token
+      - name: Select sync token
+        id: auth
         env:
-          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          CUSTOM_SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          DEFAULT_SYNC_TOKEN: ${{ github.token }}
         run: |
-          if [ -z "$SYNC_TOKEN" ]; then
-            echo "::error::Repository secret UPSTREAM_SYNC_TOKEN is not configured."
-            exit 1
+          token="$DEFAULT_SYNC_TOKEN"
+          uses_custom_token=false
+          if [ -n "$CUSTOM_SYNC_TOKEN" ]; then
+            response="$RUNNER_TEMP/sync-token-repo.json"
+            status=$(curl --silent --show-error --retry 2 \
+              --connect-timeout 10 --max-time 30 \
+              --output "$response" --write-out '%{http_code}' \
+              --header "Authorization: Bearer $CUSTOM_SYNC_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY") || status=000
+            if [ "$status" = "200" ] && jq -e '.permissions.push == true' "$response" > /dev/null; then
+              token="$CUSTOM_SYNC_TOKEN"
+              uses_custom_token=true
+            else
+              echo "::warning::UPSTREAM_SYNC_TOKEN is invalid or lacks repository write access (HTTP $status). Falling back to GITHUB_TOKEN."
+            fi
           fi
+          echo "SYNC_TOKEN=$token" >> "$GITHUB_ENV"
+          echo "uses_custom_token=$uses_custom_token" >> "$GITHUB_OUTPUT"
 
       - name: Check out fork
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          ref: main
+          token: ${{ env.SYNC_TOKEN }}
 
       - name: Configure Git
         run: |
@@ -69,8 +87,17 @@ jobs:
           exit 1
 
       - name: Push merged changes
+        id: push
         if: steps.check.outputs.needs_update == 'true' && steps.merge.outputs.merged == 'true'
-        run: git push origin HEAD:main
+        env:
+          USES_CUSTOM_TOKEN: ${{ steps.auth.outputs.uses_custom_token }}
+        run: |
+          if [ "$USES_CUSTOM_TOKEN" != "true" ] && \
+            ! git diff --quiet origin/main HEAD -- .github/workflows; then
+            echo "::error::Upstream changed workflow files. Configure a valid UPSTREAM_SYNC_TOKEN with repository Contents and Workflows write access (classic PAT: repo + workflow), then rerun."
+            exit 1
+          fi
+          git push origin HEAD:main
 
       - name: Open conflict notification
         if: steps.merge.outcome == 'failure'
@@ -102,11 +129,18 @@ jobs:
         run: exit 1
 
       - name: Write summary
-        if: always() && steps.merge.outcome != 'failure'
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          NEEDS_UPDATE: ${{ steps.check.outputs.needs_update }}
+          PUSH_OUTCOME: ${{ steps.push.outcome }}
         run: |
-          if [ "${{ steps.check.outputs.needs_update }}" = "true" ]; then
+          if [ "$JOB_STATUS" != "success" ]; then
+            echo "### Upstream sync failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "See the failed step above for details. The fork was not reported as up to date." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$PUSH_OUTCOME" = "success" ]; then
             echo "### Upstream sync completed" >> "$GITHUB_STEP_SUMMARY"
             echo "Merged upstream commit \`$(git rev-parse upstream/main)\` without force." >> "$GITHUB_STEP_SUMMARY"
-          else
+          elif [ "$NEEDS_UPDATE" = "false" ]; then
             echo "### Already up to date" >> "$GITHUB_STEP_SUMMARY"
           fi
