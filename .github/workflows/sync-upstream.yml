@@ -2,7 +2,7 @@ name: Sync upstream safely
 
 on:
   schedule:
-    - cron: "0 3 * * *"
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:
@@ -58,7 +58,8 @@ jobs:
       - name: Fetch upstream
         run: |
           git remote add upstream https://github.com/shuaiplus/NodeWarden.git
-          git fetch upstream main --tags
+          # Keep upstream tag refs separate from the fork's tags.
+          git fetch --no-tags upstream main 'refs/tags/*:refs/upstream/tags/*'
 
       - name: Check for upstream changes
         id: check
@@ -100,7 +101,7 @@ jobs:
           git push origin HEAD:main
 
       - name: Open conflict notification
-        if: steps.merge.outcome == 'failure'
+        if: steps.merge.outcome == 'failure' && github.event.repository.has_issues
         env:
           GH_TOKEN: ${{ github.token }}
           CONFLICT_FILES: ${{ steps.merge.outputs.conflict_files }}
@@ -124,23 +125,116 @@ jobs:
               --body "The scheduled merge from shuaiplus/NodeWarden failed on $(date -u +%F) and was safely aborted. No force push was performed. Conflicting files: ${CONFLICT_FILES:-unknown}. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           fi
 
-      - name: Fail after conflict notification
+      - name: Fail on merge conflict
         if: steps.merge.outcome == 'failure'
         run: exit 1
+
+      - name: Sync upstream tags reachable from main
+        shell: bash
+        run: |
+          tags=$(git for-each-ref --merged=HEAD --format='%(refname) %(objectname)' refs/upstream/tags/)
+          tag_refspecs=()
+          conflicting_tags=()
+
+          while read -r upstream_ref upstream_object; do
+            [[ -n "$upstream_ref" ]] || continue
+            tag_ref="refs/tags/${upstream_ref#refs/upstream/tags/}"
+
+            if fork_object=$(git rev-parse --verify --quiet "$tag_ref"); then
+              if [[ "$fork_object" != "$upstream_object" ]]; then
+                conflicting_tags+=("${tag_ref#refs/tags/}")
+              fi
+            else
+              tag_refspecs+=("$upstream_ref:$tag_ref")
+            fi
+          done <<< "$tags"
+
+          if (( ${#tag_refspecs[@]} > 0 )) && ! git push --atomic origin "${tag_refspecs[@]}"; then
+            {
+              echo '### Upstream tag push failed'
+              echo 'See the failed push for details. If GitHub rejected workflow permissions, check the Contents and Workflows write access of UPSTREAM_SYNC_TOKEN.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          {
+            printf '### Upstream tags\n\n'
+            printf 'Added %d tag(s).\n\n' "${#tag_refspecs[@]}"
+            if (( ${#conflicting_tags[@]} > 0 )); then
+              printf 'Existing tags that differ from upstream were preserved:\n\n'
+              printf -- '- %s\n' "${conflicting_tags[@]}"
+              printf '\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if (( ${#conflicting_tags[@]} > 0 )); then
+            echo '::error::Some upstream tags conflict with existing fork tags. See the workflow summary.'
+            exit 1
+          fi
+
+      - name: Publish releases for synced upstream tags
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Start with v1.8.2, the latest upstream release at rollout.
+          UPSTREAM_RELEASES_SINCE: "2026-11-21T10:54:25Z"
+        run: |
+          upstream_releases=$(gh api --paginate --slurp 'repos/shuaiplus/nodewarden/releases?per_page=100')
+          releases=$(jq -c --arg since "$UPSTREAM_RELEASES_SINCE" '
+            add // []
+            | map(select(.draft == false and (.published_at // "") >= $since))
+            | sort_by(.published_at)[]
+          ' <<< "$upstream_releases")
+          existing_releases=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name')
+          fork_tags=$(git ls-remote --refs --tags origin)
+          created=0
+
+          printf '### Upstream releases\n\n' >> "$GITHUB_STEP_SUMMARY"
+          while read -r release; do
+            [[ -n "$release" ]] || continue
+            tag=$(jq -r '.tag_name' <<< "$release")
+            if grep -Fxq -- "$tag" <<< "$existing_releases"; then
+              continue
+            fi
+
+            upstream_ref="refs/upstream/tags/$tag"
+            if ! upstream_object=$(git rev-parse --verify --quiet "$upstream_ref") ||
+               ! git merge-base --is-ancestor "$upstream_ref^{commit}" HEAD ||
+               ! grep -Fxq -- "$(printf '%s\trefs/tags/%s' "$upstream_object" "$tag")" <<< "$fork_tags"; then
+              printf -- '- Deferred %s until its upstream tag is synced.\n' "$tag" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            name=$(jq -r 'if (.name // "") == "" then .tag_name else .name end' <<< "$release")
+            url=$(jq -r '.html_url' <<< "$release")
+            release_args=(--repo "$GITHUB_REPOSITORY" --verify-tag --title "$name"
+                          --notes "[Upstream release notes and downloads]($url)")
+            if jq -e '.prerelease' <<< "$release" >/dev/null; then
+              release_args+=(--prerelease --latest=false)
+            fi
+            gh release create "${release_args[@]}" -- "$tag"
+            created=$((created + 1))
+          done <<< "$releases"
+          printf '\nPublished %d release(s).\n\n' "$created" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Write summary
         if: always()
         env:
           JOB_STATUS: ${{ job.status }}
           NEEDS_UPDATE: ${{ steps.check.outputs.needs_update }}
+          MERGE_OUTCOME: ${{ steps.merge.outcome }}
+          CONFLICT_FILES: ${{ steps.merge.outputs.conflict_files }}
           PUSH_OUTCOME: ${{ steps.push.outcome }}
         run: |
-          if [ "$JOB_STATUS" != "success" ]; then
-            echo "### Upstream sync failed" >> "$GITHUB_STEP_SUMMARY"
-            echo "See the failed step above for details. The fork was not reported as up to date." >> "$GITHUB_STEP_SUMMARY"
+          if [ "$MERGE_OUTCOME" = "failure" ]; then
+            printf '### Upstream merge conflict\n\nConflicting files: %s\n' \
+              "${CONFLICT_FILES:-unknown}" >> "$GITHUB_STEP_SUMMARY"
           elif [ "$PUSH_OUTCOME" = "success" ]; then
-            echo "### Upstream sync completed" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Main branch synchronized" >> "$GITHUB_STEP_SUMMARY"
             echo "Merged upstream commit \`$(git rev-parse upstream/main)\` without force." >> "$GITHUB_STEP_SUMMARY"
           elif [ "$NEEDS_UPDATE" = "false" ]; then
-            echo "### Already up to date" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Main branch already up to date" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$JOB_STATUS" != "success" ]; then
+            echo "### Main branch sync failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "See the failed step above for details." >> "$GITHUB_STEP_SUMMARY"
           fi
