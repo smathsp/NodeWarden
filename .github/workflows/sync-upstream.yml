@@ -152,7 +152,7 @@ jobs:
           if (( ${#tag_refspecs[@]} > 0 )) && ! git push --atomic origin "${tag_refspecs[@]}"; then
             {
               echo '### Upstream tag push failed'
-              echo 'See the failed push for details. If GitHub rejected workflow permissions, check the Contents and Workflows write access of `UPSTREAM_SYNC_TOKEN`.'
+              echo 'See the failed push for details. If GitHub rejected workflow permissions, check the Contents and Workflows write access of UPSTREAM_SYNC_TOKEN.'
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
@@ -162,7 +162,7 @@ jobs:
             printf 'Added %d tag(s).\n\n' "${#tag_refspecs[@]}"
             if (( ${#conflicting_tags[@]} > 0 )); then
               printf 'Existing tags that differ from upstream were preserved:\n\n'
-              printf -- '- `%s`\n' "${conflicting_tags[@]}"
+              printf -- '- %s\n' "${conflicting_tags[@]}"
               printf '\n'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
@@ -171,6 +171,51 @@ jobs:
             echo '::error::Some upstream tags conflict with existing fork tags. See the workflow summary.'
             exit 1
           fi
+
+      - name: Publish releases for synced upstream tags
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Start with v1.8.2, the latest upstream release at rollout.
+          UPSTREAM_RELEASES_SINCE: "2026-11-21T10:54:25Z"
+        run: |
+          upstream_releases=$(gh api --paginate --slurp 'repos/shuaiplus/nodewarden/releases?per_page=100')
+          releases=$(jq -c --arg since "$UPSTREAM_RELEASES_SINCE" '
+            add // []
+            | map(select(.draft == false and (.published_at // "") >= $since))
+            | sort_by(.published_at)[]
+          ' <<< "$upstream_releases")
+          existing_releases=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name')
+          fork_tags=$(git ls-remote --refs --tags origin)
+          created=0
+
+          printf '### Upstream releases\n\n' >> "$GITHUB_STEP_SUMMARY"
+          while read -r release; do
+            [[ -n "$release" ]] || continue
+            tag=$(jq -r '.tag_name' <<< "$release")
+            if grep -Fxq -- "$tag" <<< "$existing_releases"; then
+              continue
+            fi
+
+            upstream_ref="refs/upstream/tags/$tag"
+            if ! upstream_object=$(git rev-parse --verify --quiet "$upstream_ref") ||
+               ! git merge-base --is-ancestor "$upstream_ref^{commit}" HEAD ||
+               ! grep -Fxq -- "$(printf '%s\trefs/tags/%s' "$upstream_object" "$tag")" <<< "$fork_tags"; then
+              printf -- '- Deferred %s until its upstream tag is synced.\n' "$tag" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            name=$(jq -r 'if (.name // "") == "" then .tag_name else .name end' <<< "$release")
+            url=$(jq -r '.html_url' <<< "$release")
+            release_args=(--repo "$GITHUB_REPOSITORY" --verify-tag --title "$name"
+                          --notes "[Upstream release notes and downloads]($url)")
+            if jq -e '.prerelease' <<< "$release" >/dev/null; then
+              release_args+=(--prerelease --latest=false)
+            fi
+            gh release create "${release_args[@]}" -- "$tag"
+            created=$((created + 1))
+          done <<< "$releases"
+          printf '\nPublished %d release(s).\n\n' "$created" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Write summary
         if: always()
